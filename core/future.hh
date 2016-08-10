@@ -856,7 +856,8 @@ public:
                     Func,
                     Result,
                     true //is_future<std::result_of_t<Func(T&&...)>>::value TODO(jbakamovic): Uncomment once implementation for non-futures is provided
-            >(std::forward<Func>(func));
+            >(std::forward<Func>(func))(*this);
+    }
 
     template <typename Func, typename Result, bool FuncReturnsFuture>
     struct then_impl;
@@ -877,8 +878,9 @@ public:
                     return futurator::apply(std::forward<Func>(_func), fut.get_available_state().get_value());
                 }
             }
+
             typename futurator::promise_type pr;
-            auto f = pr.get_future();
+            auto new_future = pr.get_future();
             try {
                 fut.schedule([pr = std::move(pr), func = std::forward<Func>(_func)] (auto&& state) mutable {
                     if (state.failed()) {
@@ -893,7 +895,7 @@ public:
                 // ready future while 'this' future is not ready
                 abort();
             }
-            return f;
+            return new_future;
         }
     };
 
@@ -929,24 +931,56 @@ public:
     template <typename Func, typename Result = futurize_t<std::result_of_t<Func(future)>>>
     Result
     then_wrapped(Func&& func) noexcept {
-        using futurator = futurize<std::result_of_t<Func(future)>>;
-        if (available() && !need_preempt()) {
-            return futurator::apply(std::forward<Func>(func), future(get_available_state()));
-        }
-        typename futurator::promise_type pr;
-        auto fut = pr.get_future();
-        try {
-            schedule([pr = std::move(pr), func = std::forward<Func>(func)] (auto&& state) mutable {
-                futurator::apply(std::forward<Func>(func), future(std::move(state))).forward_to(std::move(pr));
-            });
-        } catch (...) {
-            // catch possible std::bad_alloc in schedule() above
-            // nothing can be done about it, we cannot break future chain by returning
-            // ready future while 'this' future is not ready
-            abort();
-        }
-        return fut;
+        return then_wrapped_impl<
+                    Func,
+                    Result,
+                    true //is_future<std::result_of_t<Func(future)>>::value TODO(jbakamovic): Uncomment once implementation for non-futures is provided
+                >(std::forward<Func>(func))(*this);
     }
+
+    template <typename Func, typename Result, bool FuncReturnsFuture>
+    struct then_wrapped_impl;
+
+    template <typename Func, typename Result>
+    struct then_wrapped_impl<Func, Result, true> {
+        Func _func;
+
+        then_wrapped_impl(Func&& func) : _func(std::forward<Func>(func))
+        { }
+
+        Result operator()(future<T...>& fut) {
+            using futurator = futurize<std::result_of_t<Func(future)>>;
+            if (fut.available() && !need_preempt()) {
+                return futurator::apply(std::forward<Func>(_func), future(fut.get_available_state()));
+            }
+
+            typename futurator::promise_type pr;
+            auto new_future = pr.get_future();
+            try {
+                fut.schedule([pr = std::move(pr), func = std::forward<Func>(_func)] (auto&& state) mutable {
+                    futurator::apply(std::forward<Func>(func), future(std::move(state))).forward_to(std::move(pr));
+                });
+            } catch (...) {
+                // catch possible std::bad_alloc in schedule() above
+                // nothing can be done about it, we cannot break future chain by returning
+                // ready future while 'this' future is not ready
+                abort();
+            }
+            return new_future;
+        }
+    };
+
+    template <typename Func, typename Result>
+    struct then_wrapped_impl<Func, Result, false> {
+        Func _func;
+
+        then_wrapped_impl(Func&& func) : _func(std::forward<Func>(func))
+        { }
+
+        Result operator()(future<T...>& fut) {
+            /* TODO(jbakamovic): Implement */
+        }
+    };
 
     /// \brief Satisfy some \ref promise object with this future as a result.
     ///
