@@ -416,6 +416,7 @@ class promise {
     future_state<T...> _local_state;
     future_state<T...>* _state;
     std::unique_ptr<task> _task;
+    bool _bypass_task_scheduling = false;
     static constexpr bool copy_noexcept = future_state<T...>::copy_noexcept;
 public:
     /// \brief Constructs an empty \c promise.
@@ -424,7 +425,7 @@ public:
     promise() noexcept : _state(&_local_state) {}
 
     /// \brief Moves a \c promise object.
-    promise(promise&& x) noexcept : _future(x._future), _state(x._state), _task(std::move(x._task)) {
+    promise(promise&& x) noexcept : _future(x._future), _state(x._state), _task(std::move(x._task)), _bypass_task_scheduling(x._bypass_task_scheduling) {
         if (_state == &x._local_state) {
             _state = &_local_state;
             _local_state = std::move(x._local_state);
@@ -506,11 +507,12 @@ public:
     }
 private:
     template <typename Func>
-    void schedule(Func&& func) {
+    void schedule(Func&& func, bool bypass_task_scheduling) {
         auto tws = std::make_unique<continuation<Func, T...>>(std::move(func));
         _state = &tws->_state;
         _task = std::move(tws);
-    }
+        _bypass_task_scheduling = bypass_task_scheduling;
+    };
     __attribute__((always_inline))
     void make_ready() noexcept;
     void migrated() noexcept;
@@ -692,13 +694,14 @@ private:
     future_state<T...>* state() noexcept {
         return _promise ? _promise->_state : &_local_state;
     }
+
     template <typename Func>
-    void schedule(Func&& func) {
+    void schedule(Func&& func, bool bypass_task_scheduling) {
         if (state()->available()) {
             ::schedule(std::make_unique<continuation<Func, T...>>(std::move(func), std::move(*state())));
         } else {
             assert(_promise);
-            _promise->schedule(std::move(func));
+            _promise->schedule(std::move(func), bypass_task_scheduling);
             _promise->_future = nullptr;
             _promise = nullptr;
         }
@@ -813,7 +816,7 @@ public:
         schedule([this, thread] (future_state<T...>&& new_state) {
             *state() = std::move(new_state);
             seastar::thread_impl::switch_in(thread);
-        });
+        }, false);
         seastar::thread_impl::switch_out(thread);
     }
     /// \endcond
@@ -852,33 +855,48 @@ public:
     template <typename Func, typename Result = futurize_t<std::result_of_t<Func(T&&...)>>>
     Result
     then(Func&& func) noexcept {
-        using futurator = futurize<std::result_of_t<Func(T&&...)>>;
-        if (available() && !need_preempt()) {
-            if (failed()) {
-                return futurator::make_exception_future(get_available_state().get_exception());
-            } else {
-                return futurator::apply(std::forward<Func>(func), get_available_state().get_value());
-            }
-        }
-        typename futurator::promise_type pr;
-        auto fut = pr.get_future();
-        try {
-            schedule([pr = std::move(pr), func = std::forward<Func>(func)] (auto&& state) mutable {
-                if (state.failed()) {
-                    pr.set_exception(std::move(state).get_exception());
-                } else {
-                    futurator::apply(std::forward<Func>(func), std::move(state).get_value()).forward_to(std::move(pr));
-                }
-            });
-        } catch (...) {
-            // catch possible std::bad_alloc in schedule() above
-            // nothing can be done about it, we cannot break future chain by returning
-            // ready future while 'this' future is not ready
-            abort();
-        }
-        return fut;
+        return then_impl<
+                    Func,
+                    Result,
+                    is_future<std::result_of_t<Func(T&&...)>>::value
+            >(std::forward<Func>(func))(*this);
     }
 
+    template <typename Func, typename Result, bool FuncReturnsFuture>
+    struct then_impl {
+        Func _func;
+
+        then_impl(Func&& func) : _func(std::forward<Func>(func))
+        { }
+
+        Result operator()(future<T...>& fut) {
+            using futurator = futurize<std::result_of_t<Func(T&&...)>>;
+            if (fut.available() && !need_preempt()) {
+                if (fut.failed()) {
+                    return futurator::make_exception_future(fut.get_available_state().get_exception());
+                } else {
+                    return futurator::apply(std::forward<Func>(_func), fut.get_available_state().get_value());
+                }
+            }
+            typename futurator::promise_type pr;
+            auto f = pr.get_future();
+            try {
+                fut.schedule([pr = std::move(pr), func = std::forward<Func>(_func)] (auto&& state) mutable {
+                    if (state.failed()) {
+                        pr.set_exception(std::move(state).get_exception());
+                    } else {
+                        futurator::apply(std::forward<Func>(func), std::move(state).get_value()).forward_to(std::move(pr));
+                    }
+                }, !FuncReturnsFuture);
+            } catch (...) {
+                // catch possible std::bad_alloc in schedule() above
+                // nothing can be done about it, we cannot break future chain by returning
+                // ready future while 'this' future is not ready
+                abort();
+            }
+            return f;
+        }
+    };
 
     /// \brief Schedule a block of code to run when the future is ready, allowing
     ///        for exception handling.
@@ -898,24 +916,41 @@ public:
     template <typename Func, typename Result = futurize_t<std::result_of_t<Func(future)>>>
     Result
     then_wrapped(Func&& func) noexcept {
-        using futurator = futurize<std::result_of_t<Func(future)>>;
-        if (available() && !need_preempt()) {
-            return futurator::apply(std::forward<Func>(func), future(get_available_state()));
-        }
-        typename futurator::promise_type pr;
-        auto fut = pr.get_future();
-        try {
-            schedule([pr = std::move(pr), func = std::forward<Func>(func)] (auto&& state) mutable {
-                futurator::apply(std::forward<Func>(func), future(std::move(state))).forward_to(std::move(pr));
-            });
-        } catch (...) {
-            // catch possible std::bad_alloc in schedule() above
-            // nothing can be done about it, we cannot break future chain by returning
-            // ready future while 'this' future is not ready
-            abort();
-        }
-        return fut;
+        return then_wrapped_impl<
+                    Func,
+                    Result,
+                    is_future<std::result_of_t<Func(future)>>::value
+            >(std::forward<Func>(func))(*this);
     }
+
+    template <typename Func, typename Result, bool FuncReturnsFuture>
+    struct then_wrapped_impl {
+        Func _func;
+
+        then_wrapped_impl(Func&& func) : _func(std::forward<Func>(func))
+        { }
+
+        Result operator()(future<T...>& fut) {
+            using futurator = futurize<std::result_of_t<Func(future)>>;
+            if (fut.available() && !need_preempt()) {
+                return futurator::apply(std::forward<Func>(_func), future(fut.get_available_state()));
+            }
+            typename futurator::promise_type pr;
+            auto f = pr.get_future();
+            try {
+                fut.schedule([pr = std::move(pr), func = std::forward<Func>(_func)] (auto&& state) mutable {
+                    futurator::apply(std::forward<Func>(func), future(std::move(state))).forward_to(std::move(pr));
+                }, !FuncReturnsFuture);
+            } catch (...) {
+                // catch possible std::bad_alloc in schedule() above
+                // nothing can be done about it, we cannot break future chain by returning
+                // ready future while 'this' future is not ready
+                abort();
+            }
+            return f;
+        }
+    };
+
 
     /// \brief Satisfy some \ref promise object with this future as a result.
     ///
@@ -1098,7 +1133,13 @@ inline
 void promise<T...>::make_ready() noexcept {
     if (_task) {
         _state = nullptr;
-        ::schedule(std::move(_task));
+        if (_bypass_task_scheduling) {
+            _bypass_task_scheduling = false;
+            _task->run();
+            _task.reset(nullptr);
+        } else {
+            ::schedule(std::move(_task));
+        }
     }
 }
 
