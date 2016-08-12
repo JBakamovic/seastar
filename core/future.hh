@@ -855,7 +855,7 @@ public:
         return then_impl<
                     Func,
                     Result,
-                    true //is_future<std::result_of_t<Func(T&&...)>>::value TODO(jbakamovic): Uncomment once implementation for non-futures is provided
+                    is_future<std::result_of_t<Func(T&&...)>>::value
             >(std::forward<Func>(func))(*this);
     }
 
@@ -908,6 +908,8 @@ public:
 
         Result operator()(future<T...>& fut) {
             /* TODO(jbakamovic): Implement */
+            using futurator = futurize<std::result_of_t<Func(T&&...)>>;
+            return futurator::apply(std::forward<Func>(_func), fut.get_available_state().get_value());
         }
     };
 
