@@ -21,6 +21,7 @@
 
 #include "tests/test-utils.hh"
 
+#include "core/print.hh"
 #include "core/shared_ptr.hh"
 #include "core/future-util.hh"
 #include "core/sleep.hh"
@@ -33,6 +34,19 @@ class expected_exception : std::runtime_error {
 public:
     expected_exception() : runtime_error("expected") {}
 };
+
+future<int> get_int() {
+    print("------ Enter: get_int()\n");
+    return make_ready_future<int>(10);
+}
+
+SEASTAR_TEST_CASE(test_then_optimization) {
+    print("------ Enter: test_then_optimization()\n");
+    return get_int().then([] (int x) {
+        print("------ Enter: lambda(int x). x = %d\n", x);
+        BOOST_REQUIRE(x == 10);
+    });
+}
 
 SEASTAR_TEST_CASE(test_finally_is_called_on_success_and_failure) {
     auto finally1 = make_shared<bool>();
