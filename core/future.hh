@@ -852,41 +852,60 @@ public:
     template <typename Func, typename Result = futurize_t<std::result_of_t<Func(T&&...)>>>
     Result
     then(Func&& func) noexcept {
-        return then_impl<
-                    Func,
-                    Result,
-                    is_future<std::result_of_t<Func(T&&...)>>::value
-            >(std::forward<Func>(func))(*this);
+        return then_impl<Result>(then_body<Func, Result, is_future<std::result_of_t<Func(T&&...)>>::value>(std::forward<Func>(func)));
+    }
+
+    template <typename Result, typename Func>
+    Result
+    then_impl(Func&& func) noexcept {
+        using futurator = futurize<Result>;
+        if (available() && !need_preempt()) {
+            if (failed()) {
+                return futurator::make_exception_future(get_available_state().get_exception());
+            } else {
+                return futurator::apply(std::forward<Func>(func), future(get_available_state()));
+            }
+        }
+
+        typename futurator::promise_type pr;
+        auto fut = pr.get_future();
+        try {
+            schedule([pr = std::move(pr), func = std::forward<Func>(func)] (auto&& state) mutable {
+                if (state.failed()) {
+                    pr.set_exception(std::move(state).get_exception());
+                } else {
+                    futurator::apply(std::forward<Func>(func), future(std::move(state))).forward_to(std::move(pr));
+                }
+            });
+        } catch (...) {
+            // catch possible std::bad_alloc in schedule() above
+            // nothing can be done about it, we cannot break future chain by returning
+            // ready future while 'this' future is not ready
+            abort();
+        }
+        return fut;
     }
 
     template <typename Func, typename Result, bool FuncReturnsFuture>
-    struct then_impl;
+    struct then_body;
 
     template <typename Func, typename Result>
-    struct then_impl<Func, Result, true> {
+    struct then_body<Func, Result, true> {
         Func _func;
 
-        then_impl(Func&& func) : _func(std::forward<Func>(func))
+        then_body(Func&& func) : _func(std::forward<Func>(func))
         { }
 
-        Result operator()(future<T...>& fut) {
+        Result operator()(future<T...>&& result) {
             using futurator = futurize<std::result_of_t<Func(T&&...)>>;
-            if (fut.available() && !need_preempt()) {
-                if (fut.failed()) {
-                    return futurator::make_exception_future(fut.get_available_state().get_exception());
-                } else {
-                    return futurator::apply(std::forward<Func>(_func), fut.get_available_state().get_value());
-                }
-            }
-
             typename futurator::promise_type pr;
-            auto new_future = pr.get_future();
+            auto fut = pr.get_future();
             try {
-                fut.schedule([pr = std::move(pr), func = std::forward<Func>(_func)] (auto&& state) mutable {
+                result.schedule([pr = std::move(pr), func = std::forward<Func>(_func)] (auto&& state) mutable {
                     if (state.failed()) {
                         pr.set_exception(std::move(state).get_exception());
                     } else {
-                        futurator::apply(func, std::move(state).get_value()).forward_to(std::move(pr));
+                        futurator::apply(std::forward<Func>(func), std::move(state).get_value()).forward_to(std::move(pr));
                     }
                 });
             } catch (...) {
@@ -895,21 +914,20 @@ public:
                 // ready future while 'this' future is not ready
                 abort();
             }
-            return new_future;
+            return fut;
         }
     };
 
     template <typename Func, typename Result>
-    struct then_impl<Func, Result, false> {
+    struct then_body<Func, Result, false> {
         Func _func;
 
-        then_impl(Func&& func) : _func(std::forward<Func>(func))
+        then_body(Func&& func) : _func(std::forward<Func>(func))
         { }
 
-        Result operator()(future<T...>& fut) {
-            /* TODO(jbakamovic): Implement */
+        Result operator()(future<T...>&& result) {
             using futurator = futurize<std::result_of_t<Func(T&&...)>>;
-            return futurator::apply(std::forward<Func>(_func), fut.get_available_state().get_value());
+            return futurator::apply(std::forward<Func>(_func), result.get_available_state().get_value());
         }
     };
 

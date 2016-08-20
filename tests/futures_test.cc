@@ -36,14 +36,11 @@ public:
 };
 
 future<int> get_int() {
-    print("------ Enter: get_int()\n");
     return make_ready_future<int>(10);
 }
 
 SEASTAR_TEST_CASE(test_then_optimization) {
-    print("------ Enter: test_then_optimization()\n");
     return get_int().then([] (int x) {
-        print("------ Enter: lambda(int x). x = %d\n", x);
         BOOST_REQUIRE(x == 10);
     });
 }
