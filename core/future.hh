@@ -951,33 +951,49 @@ public:
     template <typename Func, typename Result = futurize_t<std::result_of_t<Func(future)>>>
     Result
     then_wrapped(Func&& func) noexcept {
-        return then_wrapped_impl<
-                    Func,
-                    Result,
-                    true //is_future<std::result_of_t<Func(future)>>::value TODO(jbakamovic): Uncomment once implementation for non-futures is provided
-                >(std::forward<Func>(func))(*this);
+        return then_wrapped_impl<Result>(then_wrapped_body<Func, Result, is_future<std::result_of_t<Func(future)>>::value>(std::forward<Func>(func)));
     }
 
+    template <typename Result, typename Func>
+    Result
+    then_wrapped_impl(Func&& func) noexcept {
+        using futurator = futurize<std::result_of_t<Func(future)>>;
+        if (available() && !need_preempt()) {
+            return futurator::apply(std::forward<Func>(func), future(get_available_state()));
+        }
+
+        typename futurator::promise_type pr;
+        auto fut = pr.get_future();
+        try {
+            schedule([pr = std::move(pr), func = std::forward<Func>(func)] (auto&& state) mutable {
+                futurator::apply(std::forward<Func>(func), future(std::move(state))).forward_to(std::move(pr));
+            });
+        } catch (...) {
+            // catch possible std::bad_alloc in schedule() above
+            // nothing can be done about it, we cannot break future chain by returning
+            // ready future while 'this' future is not ready
+            abort();
+        }
+        return fut;
+    }
+
+
     template <typename Func, typename Result, bool FuncReturnsFuture>
-    struct then_wrapped_impl;
+    struct then_wrapped_body;
 
     template <typename Func, typename Result>
-    struct then_wrapped_impl<Func, Result, true> {
+    struct then_wrapped_body<Func, Result, true> {
         Func _func;
 
-        then_wrapped_impl(Func&& func) : _func(std::forward<Func>(func))
+        then_wrapped_body(Func&& func) : _func(std::forward<Func>(func))
         { }
 
-        Result operator()(future<T...>& fut) {
+        Result operator()(future<T...>&& result) {
             using futurator = futurize<std::result_of_t<Func(future)>>;
-            if (fut.available() && !need_preempt()) {
-                return futurator::apply(std::forward<Func>(_func), future(fut.get_available_state()));
-            }
-
             typename futurator::promise_type pr;
-            auto new_future = pr.get_future();
+            auto fut = pr.get_future();
             try {
-                fut.schedule([pr = std::move(pr), func = std::forward<Func>(_func)] (auto&& state) mutable {
+                result.schedule([pr = std::move(pr), func = std::forward<Func>(_func)] (auto&& state) mutable {
                     futurator::apply(std::forward<Func>(func), future(std::move(state))).forward_to(std::move(pr));
                 });
             } catch (...) {
@@ -986,19 +1002,20 @@ public:
                 // ready future while 'this' future is not ready
                 abort();
             }
-            return new_future;
+            return fut;
         }
     };
 
     template <typename Func, typename Result>
-    struct then_wrapped_impl<Func, Result, false> {
+    struct then_wrapped_body<Func, Result, false> {
         Func _func;
 
-        then_wrapped_impl(Func&& func) : _func(std::forward<Func>(func))
+        then_wrapped_body(Func&& func) : _func(std::forward<Func>(func))
         { }
 
-        Result operator()(future<T...>& fut) {
-            /* TODO(jbakamovic): Implement */
+        Result operator()(future<T...>&& result) {
+            using futurator = futurize<std::result_of_t<Func(future)>>;
+            return futurator::apply(std::forward<Func>(_func), future(result.get_available_state()));
         }
     };
 
